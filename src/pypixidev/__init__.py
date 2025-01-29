@@ -76,9 +76,20 @@ def check_pyproject(path: Path) -> bool:
     )
 
 
-def gather_pyproject_reqs(pyprojects: list[str]) -> list[str]:
-    """Gather all requirements specifiers from pyproject.toml files"""
+def gather_pyproject_reqs(pyprojects: list[str]) -> tuple[list[str], str]:
+    """Gather all requirements specifiers from pyproject.toml files
+
+    Args:
+        pyprojects: list of paths to pyproject.toml files, optionally with
+            trailing comma separated lists of extras enclosed in square
+            brackets (like "./pyproject.toml[dev,docs]")
+
+    Returns:
+        tuple with list of Python dependency specifiers and set of version
+        specifiers for python-requires as a string.
+    """
     requirements = []
+    requires_python = []
 
     for pyproject in pyprojects:
         name, extras = _split_extras(pyproject)
@@ -117,12 +128,26 @@ def gather_pyproject_reqs(pyprojects: list[str]) -> list[str]:
             else:
                 ValueError(f"Unable to process extra {extra} for {pyproject}")
 
-    return requirements
+        if "requires-python" in project:
+            requires_python.append(project["python-requires"])
+
+    return requirements, ",".join(requires_python)
 
 
-def gather_setuptools_reqs(setuptools_paths: list[str]) -> list[str]:
-    """Gather all requirements specifiers from setup.cfg files"""
+def gather_setuptools_reqs(setuptools_paths: list[str]) -> tuple[list[str], str]:
+    """Gather all requirements specifiers from setup.cfg files
+
+    Args:
+        setuptools_paths: list of paths to setup.cfg files, optionally with
+            trailing comma separated lists of extras enclosed in square
+            brackets (like "./setup.cfg[dev,docs]")
+
+    Returns:
+        tuple with list of Python dependency specifiers and set of version
+        specifiers for python-requires as a string.
+    """
     requirements = []
+    requires_python = []
 
     for setup in setuptools_paths:
         name, extras = _split_extras(setup)
@@ -155,7 +180,10 @@ def gather_setuptools_reqs(setuptools_paths: list[str]) -> list[str]:
             else:
                 requirements.extend(r for r in extras_require.splitlines() if r)
 
-    return requirements
+        if "options" in config and "python_requires" in config["options"]:
+            requires_python.append(config["options"]["python_requires"])
+
+    return requirements, ",".join(requires_python)
 
 
 def gatther_requirements_reqs(requirements_in: list[str]) -> list[str]:
@@ -284,18 +312,18 @@ def detect_packages(
     return pyprojects, setups, requirements
 
 
-def get_python_deps(requirement: Requirement) -> list[Requirement]:
+def get_python_deps(requirement: Requirement) -> tuple[list[Requirement], str]:
     """Get dependencies of a requirement"""
     tmpdir = tempfile.mkdtemp()
-    req_str = str(requirement).partition(";")[0].strip()
-    proc = run(
-        ["pip", "download", "--no-deps", "--only-binary=:all:", req_str],
-        cwd=tmpdir,
-        capture_output=True,
-        text=True,
-    )
-
     try:
+        req_str = str(requirement).partition(";")[0].strip()
+        proc = run(
+            ["pip", "download", "--no-deps", "--only-binary=:all:", req_str],
+            cwd=tmpdir,
+            capture_output=True,
+            text=True,
+        )
+
         if proc.returncode != 0:
             raise RuntimeError(
                 f"pip download {requirement} failed:\n{proc.stdout}\n{proc.stderr}"
@@ -308,21 +336,22 @@ def get_python_deps(requirement: Requirement) -> list[Requirement]:
         # requirements but have an "extra" marker on them. Markers are difficult to
         # handle: https://github.com/pypa/packaging/issues/448
         wheel_file = pkginfo.Wheel(wheels[0])
-
-        # TODO: handle markers better. Here we just filter by extras and otherwise
-        # drop markers
-        new_reqs: list[Requirement] = []
-        for req in wheel_file.requires_dist:
-            if "extra" in req.partition(";")[-1]:
-                for extra in requirement.extras:
-                    if 'extra == "{extra}"' in req:
-                        new_reqs.append(Requirement(req.partition(";")[0]))
-                        break
-            else:
-                new_reqs.append(Requirement(req))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
-    return new_reqs
+
+    # TODO: handle markers better. Here we just filter by extras and otherwise
+    # drop markers
+    new_reqs: list[Requirement] = []
+    for req in wheel_file.requires_dist:
+        if "extra" in req.partition(";")[-1]:
+            for extra in requirement.extras:
+                if 'extra == "{extra}"' in req:
+                    new_reqs.append(Requirement(req.partition(";")[0]))
+                    break
+        else:
+            new_reqs.append(Requirement(req))
+    requires_python = wheel_file.requires_python or ""
+    return new_reqs, requires_python
 
 
 def classify_requirements_one_pass(
@@ -368,15 +397,17 @@ def classify_requirements_one_pass(
 
 def classify_requirements(
     requirements: list[str],
-) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]], str]:
     """Classify requirements as conda or pypi
 
     Args:
         requirements: list of PEP440 Python package specifications
 
     Returns:
-        Two lists of tuples. The first contains conda package names and version
-        specifiers and the second contains Python package names and specifiers.
+        Two lists of tuples and a string. The first contains conda package
+        names and version specifiers and the second contains Python package
+        names and specifiers. The string contains the requires-python version
+        specifier.
     """
     packaging_reqs = [Requirement(s) for s in requirements]
     yaml = YAML()
@@ -389,10 +420,11 @@ def classify_requirements(
     )
 
     sub_python_reqs = set(python_reqs)
+    requires_python: list[str] = []
 
     while sub_python_reqs:
         req = sub_python_reqs.pop()
-        req_deps = get_python_deps(req)
+        req_deps, new_requires_python = get_python_deps(req)
         req_deps = [r for r in req_deps if r not in seen]
         new_conda_reqs, new_python_reqs = classify_requirements_one_pass(
             req_deps, grayskull_map
@@ -400,6 +432,8 @@ def classify_requirements(
         conda_reqs += new_conda_reqs
         python_reqs += new_python_reqs
         sub_python_reqs.update(new_python_reqs)
+        if new_requires_python:
+            requires_python.append(new_requires_python)
         seen.update(req_deps)
 
     conda_reqs.sort(key=lambda x: x[1].lower())
@@ -441,7 +475,7 @@ def classify_requirements(
         extras_str = f"[{','.join(extras)}]" if req.extras else ""
         python_tuples.append((f"{name}{extras_str}", str(specifiers)))
 
-    return conda_tuples, python_tuples
+    return conda_tuples, python_tuples, ",".join(requires_python)
 
 
 def prepare_editable_requirements(
@@ -572,6 +606,10 @@ def update_pixi_toml(
 
     if editable_requirements:
         pixi_config = pixi_path.read_text().splitlines()
+        # Special case "." so it does not become "" because pixi would have removed a trailing "."
+        pixi_config = [
+            line.replace(f'"{EDITABLE_PLACEHOLDER_PATH}"', '"."') for line in pixi_config
+        ]
         pixi_config = [
             line.replace(EDITABLE_PLACEHOLDER_PATH, "") for line in pixi_config
         ]
@@ -608,11 +646,25 @@ def add_pixi_dependencies(
 
     # Merged PEP508 requirement specifiers
     req_specifiers: list[str] = []
-    req_specifiers += gather_pyproject_reqs(pyprojects)
-    req_specifiers += gather_setuptools_reqs(setups)
+    requires_python: list[str] = []
+
+    new_reqs, new_requires_python = gather_pyproject_reqs(pyprojects)
+    req_specifiers.extend(new_reqs)
+    if new_requires_python:
+        requires_python.append(new_requires_python)
+
+    new_reqs, new_requires_python = gather_setuptools_reqs(setups)
+    req_specifiers.extend(new_reqs)
+    if new_requires_python:
+        requires_python.append(new_requires_python)
+
     req_specifiers += gatther_requirements_reqs(requirements)
 
-    conda_reqs, python_reqs = classify_requirements(req_specifiers)
+    conda_reqs, python_reqs, new_requires_python = classify_requirements(req_specifiers)
+    if new_requires_python:
+        requires_python.append(new_requires_python)
+    requires_python = {part for specs in requires_python for part in specs.split(",")}
+    conda_reqs.append(("python", ",".join(requires_python)))
     editable_reqs = prepare_editable_requirements(editables, Path(pixi))
 
     if print_only:
