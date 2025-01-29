@@ -1,8 +1,5 @@
 """Tool to generate a pixi dev environment for a non-pixi Python project"""
 
-# TODO: Recurse into pypi dependencies' dependencies and pull out conda
-# dependencies
-
 # TODO: Do something with extras and markers like platform specific dependencies?
 
 # TODO: Clean out Python specific versions / handle stuff like .post1
@@ -25,6 +22,8 @@ import configparser
 import itertools
 import json
 import re
+import shutil
+import tempfile
 import tomllib
 from argparse import ArgumentParser
 from collections import deque
@@ -33,8 +32,10 @@ from subprocess import run
 from typing import Any, Deque
 
 import conda.api
+import pkginfo
 from grayskull.strategy.pypi import PYPI_CONFIG
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from ruamel.yaml import YAML
 
 
@@ -128,28 +129,31 @@ def gather_setuptools_reqs(setuptools_paths: list[str]) -> list[str]:
 
         config = configparser.ConfigParser()
         config.read(name)
-        install_requires = config["options.install_requires"]
-        if install_requires.startswith("file:"):
+        if "options" not in config or "install_requires" not in config["options"]:
+            raise ValueError(f"No install_requires found in {name}")
+        install_requires = config["options"]["install_requires"].strip()
+        if install_requires.strip().startswith("file:"):
             requirements.extend(
                 read_simple_requirements(
-                    Path(name).parent / install_requires[len("file:") :].strip()
+                    Path(name).parent / install_requires[len("file:") :]
                 )
             )
         else:
-            requirements.extend(install_requires)
+            requirements.extend(r for r in install_requires.splitlines() if r)
 
         for extra in extras:
-            extras_requires = config.get(f"options.extras_requires.{extra}", None)
-            if extras_requires is None:
+            if "options.extras_require" in config and extra in config["options.extras_require"]:
+                extras_require = config["options.extras_require"][extra]
+            else:
                 raise ValueError(f"Could not process extra {extra} for {setup}")
-            if extras_requires.startswith("file:"):
+            if extras_require.startswith("file:"):
                 requirements.extend(
                     read_simple_requirements(
-                        Path(name).parent / extras_requires[len("file:") :].strip()
+                        Path(name).parent / extras_require[len("file:") :].strip()
                     )
                 )
             else:
-                requirements.extend(extras_requires)
+                requirements.extend(r for r in extras_require.splitlines() if r)
 
     return requirements
 
@@ -280,6 +284,88 @@ def detect_packages(
     return pyprojects, setups, requirements
 
 
+def get_python_deps(requirement: Requirement) -> list[Requirement]:
+    """Get dependencies of a requirement"""
+    tmpdir = tempfile.mkdtemp()
+    req_str = str(requirement).partition(";")[0].strip()
+    proc = run(
+        ["pip", "download", "--no-deps", "--only-binary=:all:", req_str],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+    )
+
+    try:
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"pip download {requirement} failed:\n{proc.stdout}\n{proc.stderr}"
+            )
+
+        wheels = list(Path(tmpdir).iterdir())
+        if len(wheels) != 1:
+            raise RuntimeError(f"Expected one .whl file but found: {wheels}")
+        # Note that extra requirements are processed just like the main
+        # requirements but have an "extra" marker on them. Markers are difficult to
+        # handle: https://github.com/pypa/packaging/issues/448
+        wheel_file = pkginfo.Wheel(wheels[0])
+
+        # TODO: handle markers better. Here we just filter by extras and otherwise
+        # drop markers
+        new_reqs: list[Requirement] = []
+        for req in wheel_file.requires_dist:
+            if "extra" in req.partition(";")[-1]:
+                for extra in requirement.extras:
+                    if 'extra == "{extra}"' in req:
+                        new_reqs.append(Requirement(req.partition(";")[0]))
+                        break
+            else:
+                new_reqs.append(Requirement(req))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return new_reqs
+
+
+def classify_requirements_one_pass(
+    requirements: list[Requirement],
+    grayskull_map: YAML,
+) -> tuple[list[tuple[Requirement, str]], list[Requirement]]:
+    """Classify requirements as conda or pypi
+
+    Args:
+        requirements: list of PEP440 Python package specifications
+
+    Returns:
+        Two lists of tuples. The first contains conda package names and version
+        specifiers and the second contains Python package names and specifiers.
+    """
+    proc = run(["conda", "info", "--json"], text=True, capture_output=True, check=True)
+    channels = json.loads(proc.stdout)["channels"]
+
+    subdirs = [conda.api.SubdirData(c) for c in channels]
+    conda_reqs: list[tuple[Requirement, str]] = []
+    python_reqs: list[Requirement] = []
+
+    for req in requirements:
+        matched = False
+        match_name = req.name
+        if match_name in grayskull_map and "conda_forge" in grayskull_map[match_name]:
+            match_name = grayskull_map[match_name]["conda_forge"]
+        # Handle pip's sloppiness about - and _
+        replacements = [("", ""), ("_", "-"), ("-", "_")]
+        for replacement, subdir in itertools.product(replacements, subdirs):
+            match_name = match_name.replace(replacement[0], replacement[1])
+            if subdir.query(match_name):
+                matched = True
+                break
+
+        if matched:
+            conda_reqs.append((req, match_name))
+        else:
+            python_reqs.append(req)
+
+    return conda_reqs, python_reqs
+
+
 def classify_requirements(
     requirements: list[str],
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -296,57 +382,71 @@ def classify_requirements(
     yaml = YAML()
     grayskull_map = yaml.load(Path(PYPI_CONFIG).read_text())
 
-    for req in packaging_reqs:
-        if req.name in grayskull_map and "conda_forge" in grayskull_map[req.name]:
-            req.name = grayskull_map[req.name]["conda_forge"]
+    seen = set(packaging_reqs)
 
-    packaging_reqs.sort(key=lambda x: x.name)
+    conda_reqs, python_reqs = classify_requirements_one_pass(
+        packaging_reqs, grayskull_map
+    )
 
-    merged_reqs = []
-    if packaging_reqs:
-        merged_reqs.append(packaging_reqs[0])
-    for req in packaging_reqs[1:]:
-        if req.name == merged_reqs[-1].name:
-            merged_reqs[-1].specifier = merged_reqs[-1].specifier & req.specifier
-            merged_reqs[-1].extras |= req.extras
-        else:
-            merged_reqs.append(req)
+    sub_python_reqs = set(python_reqs)
 
-    proc = run(["conda", "info", "--json"], text=True, capture_output=True, check=True)
-    channels = json.loads(proc.stdout)["channels"]
+    while sub_python_reqs:
+        req = sub_python_reqs.pop()
+        req_deps = get_python_deps(req)
+        req_deps = [r for r in req_deps if r not in seen]
+        new_conda_reqs, new_python_reqs = classify_requirements_one_pass(
+            req_deps, grayskull_map
+        )
+        conda_reqs += new_conda_reqs
+        python_reqs += new_python_reqs
+        sub_python_reqs.update(new_python_reqs)
+        seen.update(req_deps)
 
-    subdirs = [conda.api.SubdirData(c) for c in channels]
-    conda_reqs: tuple[str, str] = []
-    python_reqs: tuple[str, str] = []
+    conda_reqs.sort(key=lambda x: x[1].lower())
+    python_reqs.sort(key=lambda x: x.name.lower())
 
-    for req in merged_reqs:
-        matched = False
-        match_name = req.name
-        # Handle pip's sloppiness about - and _
-        replacements = [("", ""), ("_", "-"), ("-", "_")]
-        for replacement, subdir in itertools.product(replacements, subdirs):
-            match_name = req.name.replace(replacement[0], replacement[1])
-            if subdir.query(match_name):
-                matched = True
-                break
-        if matched:
-            specs = str(req.specifier).split(",")
-            for idx, spec in enumerate(specs):
-                if spec.startswith("~="):
-                    version = spec[len("~=") :]
-                    next_version = version.split(".")
-                    next_version[-1] = "0"
-                    next_version[-2] = str(int(next_version[-2]) + 1)
-                    specs[idx] = f">={version},<{'.'.join(next_version)}"
-            conda_reqs.append((match_name, ",".join(specs)))
+    conda_table: dict[str, SpecifierSet] = {}
+    for req, name in conda_reqs:
+        name = name.lower()
+        conda_table.setdefault(name, req.specifier)
+        conda_table[name] = req.specifier & conda_table[name]
 
-        if not matched:
-            python_reqs.append((req.name, str(req.specifier)))
+    canonical_re = re.compile(r"[-_.]+")
+    python_table: dict[str, tuple[set[str], SpecifierSet]] = {}
+    for req in python_reqs:
+        name = canonical_re.sub("-", req.name.lower())
+        python_table.setdefault(name, (req.extras, req.specifier))
+        python_table[name] = (
+            python_table[name][0] | req.extras,
+            python_table[name][1] & req.specifier,
+        )
 
-    return conda_reqs, python_reqs
+    conda_tuples: list[tuple[str, str]] = []
+    for name in sorted(conda_table):
+        specifiers = conda_table[name]
+        specs = str(specifiers).split(",")
+        for idx, spec in enumerate(specs):
+            if spec.startswith("~="):
+                version = spec[len("~=") :]
+                next_version = version.split(".")
+                next_version[-1] = "0"
+                next_version[-2] = str(int(next_version[-2]) + 1)
+                specs[idx] = f">={version},<{'.'.join(next_version)}"
+
+        conda_tuples.append((name, ",".join(specs)))
+
+    python_tuples: list[tuple[str, str]] = []
+    for name in sorted(python_table):
+        extras, specifiers = python_table[name]
+        extras_str = f"[{','.join(extras)}]" if req.extras else ""
+        python_tuples.append((f"{name}{extras_str}", str(specifiers)))
+
+    return conda_tuples, python_tuples
 
 
-def prepare_editable_requirements(editable_paths: list[str], pixi_path: Path) -> list[str]:
+def prepare_editable_requirements(
+    editable_paths: list[str], pixi_path: Path
+) -> list[str]:
     """Convert paths to editable projets into editable pip specs"""
     editables_name_path: list[tuple[str, Path]] = []
     for spec in editable_paths:
@@ -361,7 +461,7 @@ def prepare_editable_requirements(editable_paths: list[str], pixi_path: Path) ->
 
         path = Path(path_name)
 
-        pyproj_path = (path / "pyproject.toml")
+        pyproj_path = path / "pyproject.toml"
         if pyproj_path.exists():
             config = tomllib.loads(pyproj_path.read_text())
             name = config.get("project", {}).get("name", "")
@@ -369,12 +469,12 @@ def prepare_editable_requirements(editable_paths: list[str], pixi_path: Path) ->
                 editables_name_path.append((name, path))
                 continue
 
-        setup_path = (path / "setup.cfg")
+        setup_path = path / "setup.cfg"
         if setup_path.exists():
             config = configparser.ConfigParser()
             config.read(setup_path)
-            if "metadata.name" in config:
-                name = config["metadata.name"]
+            if "metadata" in config and "name" in config["metadata"]:
+                name = config["metadata"]["name"]
                 editables_name_path.append((name, path))
                 continue
 
@@ -465,13 +565,16 @@ def update_pixi_toml(
                 "--manifest-path",
                 pixi_path,
                 "--no-lockfile-update",
-            ] + list(pkgs),
+            ]
+            + list(pkgs),
             check=True,
         )
 
     if editable_requirements:
         pixi_config = pixi_path.read_text().splitlines()
-        pixi_config = [line.replace(EDITABLE_PLACEHOLDER_PATH, "") for line in pixi_config]
+        pixi_config = [
+            line.replace(EDITABLE_PLACEHOLDER_PATH, "") for line in pixi_config
+        ]
         pixi_path.write_text("\n".join(pixi_config))
 
 
@@ -486,7 +589,7 @@ def add_pixi_dependencies(
     print_only: bool = False,
 ):
     """Gather dependencies from inputs and insert into pixi.toml"""
-    if not any((packages, requirements, pyprojects, setups)):
+    if not any((editables, packages, requirements, pyprojects, setups)):
         raise ValueError("No valid dependency inputs provided!")
 
     editables = editables or []

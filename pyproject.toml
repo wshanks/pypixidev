@@ -3,6 +3,7 @@ authors = [{name = "Will Shanks", email = "wshaos@posteo.net"}]
 dependencies = [
     "grayskull",
     "packaging",
+    "pkginfo",
     "ruamel.yaml",
 ]
 description = "Tool for generating a pixi dev environment for a non-pixi Python project"
