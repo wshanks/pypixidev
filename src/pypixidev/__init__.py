@@ -547,13 +547,6 @@ def update_pixi_toml(
         if old_conda or old_pypi:
             print("Clearing out old dependencies:\n")
 
-        for pkgs in itertools.batched(old_conda, 20):
-            run(
-                ["pixi", "remove", "--manifest-path", pixi_path, "--no-lockfile-update"]
-                + list(pkgs),
-                check=True,
-            )
-
         for pkgs in itertools.batched(old_pypi, 20):
             run(
                 [
@@ -564,6 +557,13 @@ def update_pixi_toml(
                     "--no-lockfile-update",
                     "--pypi",
                 ]
+                + list(pkgs),
+                check=True,
+            )
+
+        for pkgs in itertools.batched(old_conda, 20):
+            run(
+                ["pixi", "remove", "--manifest-path", pixi_path, "--no-lockfile-update"]
                 + list(pkgs),
                 check=True,
             )
