@@ -129,7 +129,7 @@ def gather_pyproject_reqs(pyprojects: list[str]) -> tuple[list[str], str]:
                 ValueError(f"Unable to process extra {extra} for {pyproject}")
 
         if "requires-python" in project:
-            requires_python.append(project["python-requires"])
+            requires_python.append(project["requires-python"])
 
     return requirements, ",".join(requires_python)
 
