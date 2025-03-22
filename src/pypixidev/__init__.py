@@ -312,13 +312,16 @@ def detect_packages(
     return pyprojects, setups, requirements
 
 
-def get_python_deps(requirement: Requirement) -> tuple[list[Requirement], str]:
+def get_python_deps(requirement: Requirement, python: str | None) -> tuple[list[Requirement], str]:
     """Get dependencies of a requirement"""
     tmpdir = tempfile.mkdtemp()
     try:
         req_str = str(requirement).partition(";")[0].strip()
+        cmd = ["pip", "download", "--no-deps", "--only-binary=:all:", req_str]
+        if python:
+            cmd += ["--python-version", python]
         proc = run(
-            ["pip", "download", "--no-deps", "--only-binary=:all:", req_str],
+            cmd,
             cwd=tmpdir,
             capture_output=True,
             text=True,
@@ -397,11 +400,13 @@ def classify_requirements_one_pass(
 
 def classify_requirements(
     requirements: list[str],
+    python: str | None,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]], str]:
     """Classify requirements as conda or pypi
 
     Args:
         requirements: list of PEP440 Python package specifications
+        python: Python version to use when inspecting subdependencies
 
     Returns:
         Two lists of tuples and a string. The first contains conda package
@@ -424,7 +429,7 @@ def classify_requirements(
 
     while sub_python_reqs:
         req = sub_python_reqs.pop()
-        req_deps, new_requires_python = get_python_deps(req)
+        req_deps, new_requires_python = get_python_deps(req, python)
         req_deps = [r for r in req_deps if r not in seen]
         new_conda_reqs, new_python_reqs = classify_requirements_one_pass(
             req_deps, grayskull_map
@@ -622,6 +627,8 @@ def add_pixi_dependencies(
     requirements: list[str] | None = None,
     pyprojects: list[str] | None = None,
     setups: list[str] | None = None,
+    condas: list[str] | None = None,
+    python: str | None = None,
     pixi: str = "pixi.toml",
     clear: bool = False,
     print_only: bool = False,
@@ -635,6 +642,7 @@ def add_pixi_dependencies(
     requirements = requirements or []
     pyprojects = pyprojects or []
     setups = setups or []
+    condas = condas or []
 
     copy_editables_to_packages(editables, packages)
 
@@ -660,10 +668,15 @@ def add_pixi_dependencies(
 
     req_specifiers += gatther_requirements_reqs(requirements)
 
-    conda_reqs, python_reqs, new_requires_python = classify_requirements(req_specifiers)
+    conda_reqs, python_reqs, new_requires_python = classify_requirements(req_specifiers, python)
     if new_requires_python:
         requires_python.append(new_requires_python)
     requires_python = {part for specs in requires_python for part in specs.split(",")}
+    for req in condas:
+        split_req = req.partition(" ")
+        conda_reqs.append((split_req[0], split_req[2]))
+    if python:
+        requires_python.add(f"={python}")
     conda_reqs.append(("python", ",".join(requires_python)))
     editable_reqs = prepare_editable_requirements(editables, Path(pixi))
 
@@ -726,6 +739,22 @@ def main(raw_args: list[str] | None = None):
         help="Path to a setup.cfg file",
     )
     parser.add_argument(
+        "--conda",
+        dest="condas",
+        action="append",
+        type=str,
+        help=(
+            "Individual conda requirements to add. Use a space to add version "
+            "bound like 'root 6.28'"
+        ),
+    )
+    parser.add_argument(
+        "--python",
+        dest="python",
+        type=str,
+        help="Specific Python version to use",
+    )
+    parser.add_argument(
         "--pixi",
         "-P",
         default="pixi.toml",
@@ -751,6 +780,8 @@ def main(raw_args: list[str] | None = None):
         requirements=args.requirements,
         pyprojects=args.pyprojects,
         setups=args.setups,
+        condas=args.condas,
+        python=args.python,
         pixi=args.pixi,
         clear=args.clear,
         print_only=args.debug,
